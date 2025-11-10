@@ -1,301 +1,393 @@
-// ติดตั้ง dependencies ก่อน:
-// npm init -y
-// npm install express mysql2 bcryptjs jsonwebtoken cors dotenv
-
 const express = require("express");
-const mysql = require("mysql2/promise");
+const mysql = require("mysql2");
+const cors = require("cors");
 const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
-const cors = require("cors");
+const multer = require("multer");
 require("dotenv").config();
 
 const app = express();
-const PORT = process.env.PORT || 3001;
-const JWT_SECRET = process.env.JWT_SECRET || "Kon7076";
+const PORT = process.env.PORT;
 
 // Middleware
 app.use(cors());
 app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
 
-// Database Configuration
-const dbConfig = {
-  host: process.env.DB_HOST || "sql12.freesqldatabase.com",
-  user: process.env.DB_USER || "sql12806399",
-  password: process.env.DB_PASSWORD || "pVMVdkg7U4",
-  database: process.env.DB_NAME || "sql12806399",
-  waitForConnections: true,
-  connectionLimit: 10,
-  queueLimit: 0,
-};
+// Database connection
+const db = mysql.createConnection({
+  host: process.env.DB_HOST,
+  user: process.env.DB_USER,
+  password: process.env.DB_PASSWORD,
+  port: process.env.DB_PORT,
+  database: process.env.DB_NAME,
+});
 
-const pool = mysql.createPool(dbConfig);
-
-// สร้างตารางในฐานข้อมูล (รันครั้งแรก)
-async function initializeDatabase() {
-  try {
-    const connection = await pool.getConnection();
-
-    //     // ตารางผู้ใช้
-    //     await connection.query(`
-    //       CREATE TABLE IF NOT EXISTS users (
-    //         id INT AUTO_INCREMENT PRIMARY KEY,
-    //         username VARCHAR(50) UNIQUE NOT NULL,
-    //         email VARCHAR(100) UNIQUE NOT NULL,
-    //         password VARCHAR(255) NOT NULL,
-    //         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    //       )
-    //     `);
-
-    //     // ตารางสินค้า
-    //     await connection.query(`
-    //       CREATE TABLE IF NOT EXISTS products (
-    //     id INT AUTO_INCREMENT PRIMARY KEY,
-    //     name VARCHAR(100) NOT NULL,
-    //     description TEXT,
-    //     price DECIMAL(10,2) NOT NULL,
-    //     stock INT DEFAULT 0,
-    //     user_id INT,
-    //     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    //     updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-    //     FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE SET NULL
-    //   )
-    //     `);
-
-    connection.release();
-    console.log("✅ Database tables initialized successfully");
-  } catch (error) {
-    console.error("❌ Error initializing database:", error);
+db.connect((err) => {
+  if (err) {
+    console.error("Database connection failed:", err);
+    return;
   }
-}
+  console.log("Connected to MySQL database");
+});
 
-// Middleware: ตรวจสอบ JWT Token
+// Multer for file upload (store as base64 or URL)
+const storage = multer.memoryStorage();
+const upload = multer({ storage: storage });
+
+// JWT Middleware
 const authenticateToken = (req, res, next) => {
   const authHeader = req.headers["authorization"];
   const token = authHeader && authHeader.split(" ")[1];
 
   if (!token) {
-    return res.status(401).json({ message: "ไม่พบ token การยืนยันตัวตน" });
+    return res.status(401).json({ message: "Access token required" });
   }
 
-  jwt.verify(token, JWT_SECRET, (err, user) => {
+  jwt.verify(token, process.env.JWT_SECRET, (err, user) => {
     if (err) {
-      return res.status(403).json({ message: "Token ไม่ถูกต้อง" });
+      return res.status(403).json({ message: "Invalid token" });
     }
     req.user = user;
     next();
   });
 };
 
-// ==================== ROUTES ====================
+// Admin Middleware
+const isAdmin = (req, res, next) => {
+  if (req.user.role !== "admin") {
+    return res.status(403).json({ message: "Admin access required" });
+  }
+  next();
+};
 
-// Health Check
-app.get("/", (req, res) => {
-  res.json({ message: "API is running!", status: "OK" });
-});
+// ==================== AUTH ROUTES ====================
 
-// 1. Register (สมัครสมาชิก)
-app.post("/api/register", async (req, res) => {
+// Register
+app.post("/api/auth/register", async (req, res) => {
   try {
     const { username, email, password } = req.body;
 
-    if (!username || !email || !password) {
-      return res.status(400).json({ message: "กรุณากรอกข้อมูลให้ครบถ้วน" });
-    }
+    // Check if user exists
+    db.query(
+      "SELECT * FROM users WHERE username = ? OR email = ?",
+      [username, email],
+      async (err, results) => {
+        if (err) {
+          return res
+            .status(500)
+            .json({ message: "Database error", error: err });
+        }
+        if (results.length > 0) {
+          return res
+            .status(400)
+            .json({ message: "Username or email already exists" });
+        }
 
-    // ตรวจสอบว่า username หรือ email มีอยู่แล้วหรือไม่
-    const [existing] = await pool.query(
-      "SELECT id FROM users WHERE username = ? OR email = ?",
-      [username, email]
+        // Hash password
+        const hashedPassword = await bcrypt.hash(password, 10);
+
+        // Insert user
+        db.query(
+          "INSERT INTO users (username, email, password, role) VALUES (?, ?, ?, ?)",
+          [username, email, hashedPassword, "client"],
+          (err, result) => {
+            if (err) {
+              return res
+                .status(500)
+                .json({ message: "Failed to create user", error: err });
+            }
+            res.status(201).json({ message: "User created successfully" });
+          }
+        );
+      }
     );
-
-    if (existing.length > 0) {
-      return res
-        .status(400)
-        .json({ message: "ชื่อผู้ใช้หรืออีเมลนี้ถูกใช้งานแล้ว" });
-    }
-
-    // เข้ารหัสรหัสผ่าน
-    const hashedPassword = await bcrypt.hash(password, 10);
-
-    // บันทึกข้อมูลผู้ใช้
-    const [result] = await pool.query(
-      "INSERT INTO users (username, email, password) VALUES (?, ?, ?)",
-      [username, email, hashedPassword]
-    );
-
-    res.status(201).json({
-      message: "สมัครสมาชิกสำเร็จ",
-      userId: result.insertId,
-    });
   } catch (error) {
-    console.error("Register error:", error);
-    res.status(500).json({ message: "เกิดข้อผิดพลาดในการสมัครสมาชิก" });
+    res.status(500).json({ message: "Server error", error });
   }
 });
 
-// 2. Login (เข้าสู่ระบบ)
-app.post("/api/login", async (req, res) => {
+// Login
+app.post("/api/auth/login", (req, res) => {
   try {
     const { username, password } = req.body;
 
-    if (!username || !password) {
-      return res
-        .status(400)
-        .json({ message: "กรุณากรอกชื่อผู้ใช้และรหัสผ่าน" });
-    }
+    db.query(
+      "SELECT * FROM users WHERE username = ?",
+      [username],
+      async (err, results) => {
+        if (err) {
+          return res
+            .status(500)
+            .json({ message: "Database error", error: err });
+        }
+        if (results.length === 0) {
+          return res.status(401).json({ message: "Invalid credentials" });
+        }
 
-    // ค้นหาผู้ใช้
-    const [users] = await pool.query("SELECT * FROM users WHERE username = ?", [
-      username,
-    ]);
+        const user = results[0];
+        const isValidPassword = await bcrypt.compare(password, user.password);
 
-    if (users.length === 0) {
-      return res
-        .status(401)
-        .json({ message: "ชื่อผู้ใช้หรือรหัสผ่านไม่ถูกต้อง" });
-    }
+        if (!isValidPassword) {
+          return res.status(401).json({ message: "Invalid credentials" });
+        }
 
-    const user = users[0];
+        const token = jwt.sign(
+          { id: user.id, username: user.username, role: user.role },
+          process.env.JWT_SECRET,
+          { expiresIn: "24h" }
+        );
 
-    // ตรวจสอบรหัสผ่าน
-    const validPassword = await bcrypt.compare(password, user.password);
-    if (!validPassword) {
-      return res
-        .status(401)
-        .json({ message: "ชื่อผู้ใช้หรือรหัสผ่านไม่ถูกต้อง" });
-    }
-
-    // สร้าง JWT Token
-    const token = jwt.sign(
-      { id: user.id, username: user.username },
-      JWT_SECRET,
-      { expiresIn: "24h" }
+        res.json({
+          token,
+          user: {
+            id: user.id,
+            username: user.username,
+            email: user.email,
+            role: user.role,
+          },
+        });
+      }
     );
-
-    res.json({
-      message: "เข้าสู่ระบบสำเร็จ",
-      token,
-      userId: user.id,
-      username: user.username,
-    });
   } catch (error) {
-    console.error("Login error:", error);
-    res.status(500).json({ message: "เกิดข้อผิดพลาดในการเข้าสู่ระบบ" });
+    res.status(500).json({ message: "Server error", error });
   }
 });
 
-// 3. GET All Products (ดูสินค้าทั้งหมด)
-app.get("/api/products", authenticateToken, async (req, res) => {
-  try {
-    const [products] = await pool.query(
-      "SELECT * FROM products ORDER BY created_at DESC"
-    );
-    res.json(products);
-  } catch (error) {
-    console.error("Get products error:", error);
-    res.status(500).json({ message: "เกิดข้อผิดพลาดในการดึงข้อมูลสินค้า" });
-  }
-});
-
-// 4. GET Product by ID (ดูสินค้าตาม ID)
-app.get("/api/products/:id", authenticateToken, async (req, res) => {
-  try {
-    const [products] = await pool.query("SELECT * FROM products WHERE id = ?", [
-      req.params.id,
-    ]);
-
-    if (products.length === 0) {
-      return res.status(404).json({ message: "ไม่พบสินค้านี้" });
+// Get current user
+app.get("/api/auth/me", authenticateToken, (req, res) => {
+  db.query(
+    "SELECT id, username, email, role FROM users WHERE id = ?",
+    [req.user.id],
+    (err, results) => {
+      if (err) {
+        return res.status(500).json({ message: "Database error", error: err });
+      }
+      if (results.length === 0) {
+        return res.status(404).json({ message: "User not found" });
+      }
+      res.json(results[0]);
     }
-
-    res.json(products[0]);
-  } catch (error) {
-    console.error("Get product error:", error);
-    res.status(500).json({ message: "เกิดข้อผิดพลาดในการดึงข้อมูลสินค้า" });
-  }
+  );
 });
 
-// 5. CREATE Product (เพิ่มสินค้าใหม่)
-app.post("/api/products", authenticateToken, async (req, res) => {
-  try {
-    const { name, description, price, stock } = req.body;
+// ==================== PRODUCT ROUTES ====================
 
-    if (!name || !price) {
-      return res.status(400).json({ message: "กรุณากรอกชื่อสินค้าและราคา" });
+// Get all products (public)
+app.get("/api/products", (req, res) => {
+  db.query(
+    "SELECT * FROM products ORDER BY created_at DESC",
+    (err, results) => {
+      if (err) {
+        return res.status(500).json({ message: "Database error", error: err });
+      }
+      res.json(results);
     }
-
-    const [result] = await pool.query(
-      "INSERT INTO products (name, description, price, stock, user_id) VALUES (?, ?, ?, ?, ?)",
-      [name, description || "", price, stock || 0, req.user.id]
-    );
-
-    res.status(201).json({
-      message: "เพิ่มสินค้าสำเร็จ",
-      productId: result.insertId,
-    });
-  } catch (error) {
-    console.error("Create product error:", error);
-    res.status(500).json({ message: "เกิดข้อผิดพลาดในการเพิ่มสินค้า" });
-  }
+  );
 });
 
-// 6. UPDATE Product (แก้ไขสินค้า)
-app.put("/api/products/:id", authenticateToken, async (req, res) => {
-  try {
-    const { name, description, price, stock } = req.body;
-    const productId = req.params.id;
-
-    // ตรวจสอบว่าสินค้ามีอยู่หรือไม่
-    const [existing] = await pool.query(
-      "SELECT id FROM products WHERE id = ?",
-      [productId]
-    );
-    if (existing.length === 0) {
-      return res.status(404).json({ message: "ไม่พบสินค้านี้" });
+// Get single product (public)
+app.get("/api/products/:id", (req, res) => {
+  db.query(
+    "SELECT * FROM products WHERE id = ?",
+    [req.params.id],
+    (err, results) => {
+      if (err) {
+        return res.status(500).json({ message: "Database error", error: err });
+      }
+      if (results.length === 0) {
+        return res.status(404).json({ message: "Product not found" });
+      }
+      res.json(results[0]);
     }
-
-    await pool.query(
-      "UPDATE products SET name = ?, description = ?, price = ?, stock = ? WHERE id = ?",
-      [name, description, price, stock, productId]
-    );
-
-    res.json({ message: "แก้ไขสินค้าสำเร็จ" });
-  } catch (error) {
-    console.error("Update product error:", error);
-    res.status(500).json({ message: "เกิดข้อผิดพลาดในการแก้ไขสินค้า" });
-  }
+  );
 });
 
-// 7. DELETE Product (ลบสินค้า)
-app.delete("/api/products/:id", authenticateToken, async (req, res) => {
-  try {
-    const productId = req.params.id;
+// Create product (admin only)
+app.post("/api/products", authenticateToken, isAdmin, (req, res) => {
+  const { name, description, image, price, stock } = req.body;
 
-    const [result] = await pool.query("DELETE FROM products WHERE id = ?", [
-      productId,
-    ]);
-
-    if (result.affectedRows === 0) {
-      return res.status(404).json({ message: "ไม่พบสินค้านี้" });
+  db.query(
+    "INSERT INTO products (name, description, image, price, stock) VALUES (?, ?, ?, ?, ?)",
+    [name, description, image, price, stock],
+    (err, result) => {
+      if (err) {
+        return res
+          .status(500)
+          .json({ message: "Failed to create product", error: err });
+      }
+      res
+        .status(201)
+        .json({ message: "Product created successfully", id: result.insertId });
     }
-
-    res.json({ message: "ลบสินค้าสำเร็จ" });
-  } catch (error) {
-    console.error("Delete product error:", error);
-    res.status(500).json({ message: "เกิดข้อผิดพลาดในการลบสินค้า" });
-  }
+  );
 });
 
-// Error handling middleware
-app.use((err, req, res, next) => {
-  console.error(err.stack);
-  res.status(500).json({ message: "เกิดข้อผิดพลาดในเซิร์ฟเวอร์" });
+// Update product (admin only)
+app.put("/api/products/:id", authenticateToken, isAdmin, (req, res) => {
+  const { name, description, image, price, stock } = req.body;
+
+  db.query(
+    "UPDATE products SET name = ?, description = ?, image = ?, price = ?, stock = ? WHERE id = ?",
+    [name, description, image, price, stock, req.params.id],
+    (err, result) => {
+      if (err) {
+        return res
+          .status(500)
+          .json({ message: "Failed to update product", error: err });
+      }
+      if (result.affectedRows === 0) {
+        return res.status(404).json({ message: "Product not found" });
+      }
+      res.json({ message: "Product updated successfully" });
+    }
+  );
+});
+
+// Delete product (admin only)
+app.delete("/api/products/:id", authenticateToken, isAdmin, (req, res) => {
+  db.query(
+    "DELETE FROM products WHERE id = ?",
+    [req.params.id],
+    (err, result) => {
+      if (err) {
+        return res
+          .status(500)
+          .json({ message: "Failed to delete product", error: err });
+      }
+      if (result.affectedRows === 0) {
+        return res.status(404).json({ message: "Product not found" });
+      }
+      res.json({ message: "Product deleted successfully" });
+    }
+  );
+});
+
+// ==================== ORDER ROUTES ====================
+
+// Create order (authenticated users)
+app.post("/api/orders", authenticateToken, (req, res) => {
+  const { items } = req.body; // items: [{ product_id, quantity }]
+
+  // Calculate total and check stock
+  const productIds = items.map((item) => item.product_id);
+
+  db.query(
+    "SELECT * FROM products WHERE id IN (?)",
+    [productIds],
+    (err, products) => {
+      if (err) {
+        return res.status(500).json({ message: "Database error", error: err });
+      }
+
+      let totalAmount = 0;
+      const orderItems = [];
+
+      for (const item of items) {
+        const product = products.find((p) => p.id === item.product_id);
+        if (!product) {
+          return res
+            .status(404)
+            .json({ message: `Product ${item.product_id} not found` });
+        }
+        if (product.stock < item.quantity) {
+          return res
+            .status(400)
+            .json({ message: `Insufficient stock for ${product.name}` });
+        }
+        totalAmount += product.price * item.quantity;
+        orderItems.push({
+          product_id: item.product_id,
+          quantity: item.quantity,
+          price: product.price,
+        });
+      }
+
+      // Create order
+      db.query(
+        "INSERT INTO orders (user_id, total_amount) VALUES (?, ?)",
+        [req.user.id, totalAmount],
+        (err, result) => {
+          if (err) {
+            return res
+              .status(500)
+              .json({ message: "Failed to create order", error: err });
+          }
+
+          const orderId = result.insertId;
+
+          // Insert order items and update stock
+          const orderItemsValues = orderItems.map((item) => [
+            orderId,
+            item.product_id,
+            item.quantity,
+            item.price,
+          ]);
+
+          db.query(
+            "INSERT INTO order_items (order_id, product_id, quantity, price) VALUES ?",
+            [orderItemsValues],
+            (err) => {
+              if (err) {
+                return res
+                  .status(500)
+                  .json({
+                    message: "Failed to create order items",
+                    error: err,
+                  });
+              }
+
+              // Update stock
+              for (const item of orderItems) {
+                db.query("UPDATE products SET stock = stock - ? WHERE id = ?", [
+                  item.quantity,
+                  item.product_id,
+                ]);
+              }
+
+              res
+                .status(201)
+                .json({ message: "Order created successfully", orderId });
+            }
+          );
+        }
+      );
+    }
+  );
+});
+
+// Get user orders
+app.get("/api/orders", authenticateToken, (req, res) => {
+  const query =
+    req.user.role === "admin"
+      ? "SELECT o.*, u.username FROM orders o JOIN users u ON o.user_id = u.id ORDER BY o.created_at DESC"
+      : "SELECT * FROM orders WHERE user_id = ? ORDER BY created_at DESC";
+
+  const params = req.user.role === "admin" ? [] : [req.user.id];
+
+  db.query(query, params, (err, results) => {
+    if (err) {
+      return res.status(500).json({ message: "Database error", error: err });
+    }
+    res.json(results);
+  });
+});
+
+// Get order details
+app.get("/api/orders/:id", authenticateToken, (req, res) => {
+  db.query(
+    "SELECT oi.*, p.name, p.image FROM order_items oi JOIN products p ON oi.product_id = p.id WHERE oi.order_id = ?",
+    [req.params.id],
+    (err, results) => {
+      if (err) {
+        return res.status(500).json({ message: "Database error", error: err });
+      }
+      res.json(results);
+    }
+  );
 });
 
 // Start server
-app.listen(PORT, async () => {
-  console.log(`🚀 Server is running on Port ${PORT}`);
-  await initializeDatabase();
+app.listen(PORT, () => {
+  console.log(`Server is running on port ${PORT}`);
 });
-
-module.exports = app;
